@@ -11,9 +11,7 @@ import polyline  # for decoding encoded polyline strings
 # ================================
 # Configuration & Global Settings
 # ================================
-GRID_ROWS = 6
-GRID_COLS = 6
-SIMULATION_DURATION = 60           # simulation time in seconds
+SIMULATION_DURATION = 60           # total simulation time in seconds
 UPDATE_INTERVAL = 2                # seconds between simulation updates
 
 # Server configuration for our Flask Emergency Response Center
@@ -21,17 +19,9 @@ SERVER_HOST = '127.0.0.1'
 SERVER_PORT = 5000
 
 # GraphHopper configuration (ensure your GraphHopper server is running with western-zone-latest.osm.pbf)
-GH_API_ENDPOINT = "http://127.0.0.1:8989/route"  
+GH_API_ENDPOINT = "http://127.0.0.1:8989/route"
 
-# Helper: Convert grid coordinate to a latitude/longitude pair
-# Updated to use Mumbai (western India) as the base location.
-def grid_to_latlon(grid_coord):
-    base_lat = 19.0760    # Mumbai latitude
-    base_lon = 72.8777    # Mumbai longitude (in degrees East)
-    lat_offset = 0.01     # degrees per grid row
-    lon_offset = 0.01     # degrees per grid column
-    i, j = grid_coord
-    return (base_lat + i * lat_offset, base_lon + j * lon_offset)
+# Note: We no longer need a grid_to_latlon helper because we're using absolute coordinates.
 
 # ================================
 # Emergency Response Center (Flask App)
@@ -116,24 +106,22 @@ time.sleep(1)
 # Emergency Vehicle Simulation with GraphHopper Integration
 # ================================
 class EmergencyVehicle(threading.Thread):
-    def __init__(self, vehicle_id, start, destination):
+    def __init__(self, vehicle_id, start_latlon, dest_latlon):
+        """
+        start_latlon and dest_latlon are tuples: (latitude, longitude)
+        """
         super().__init__()
         self.vehicle_id = vehicle_id
-        self.start_grid = start
-        self.dest_grid = destination
-        self.current_pos = start  # grid coordinate (tuple)
-        # Save absolute coordinates for start and destination
-        self.start_latlon = grid_to_latlon(start)
-        self.dest_latlon = grid_to_latlon(destination)
+        self.start_latlon = start_latlon
+        self.dest_latlon = dest_latlon
+        self.current_pos = start_latlon  # current position as (lat, lon)
         self.route = ""
         self.running = True
 
     def compute_route(self):
-        """Call GraphHopper's Directions API to get a live route."""
-        start_latlon = grid_to_latlon(self.current_pos)
-        dest_latlon = grid_to_latlon(self.dest_grid)
+        """Call GraphHopper's Directions API to get a live route using absolute coordinates."""
         params = {
-            "point": [f"{start_latlon[0]},{start_latlon[1]}", f"{dest_latlon[0]},{dest_latlon[1]}"],
+            "point": [f"{self.current_pos[0]},{self.current_pos[1]}", f"{self.dest_latlon[0]},{self.dest_latlon[1]}"],
             "type": "json",
             "locale": "en",
             "profile": "car",  # using the car profile
@@ -159,7 +147,7 @@ class EmergencyVehicle(threading.Thread):
         payload = {
             "vehicle_id": self.vehicle_id,
             "current_position": self.current_pos,
-            "destination": self.dest_grid,
+            "destination": self.dest_latlon,
             "route": route,
             "route_length": round(length, 2),
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -171,14 +159,25 @@ class EmergencyVehicle(threading.Thread):
         except Exception as e:
             print(f"[{self.vehicle_id}] Error sending update: {e}")
 
-    def move_along_route(self, route):
-        """Simulate movement by incrementing grid coordinates toward the destination."""
-        if self.current_pos != self.dest_grid:
-            new_i = self.current_pos[0] + (1 if self.current_pos[0] < self.dest_grid[0] else 0)
-            new_j = self.current_pos[1] + (1 if self.current_pos[1] < self.dest_grid[1] else 0)
-            self.current_pos = (new_i, new_j)
-        else:
+    def move_along_route(self):
+        """Simulate movement along a straight line from current position to destination.
+           Moves by a fixed fraction (e.g. 20%) of the remaining distance each update.
+        """
+        cur_lat, cur_lon = self.current_pos
+        dest_lat, dest_lon = self.dest_latlon
+        # Calculate difference
+        dlat = dest_lat - cur_lat
+        dlon = dest_lon - cur_lon
+        # If the vehicle is very close to destination, stop
+        if abs(dlat) < 0.0001 and abs(dlon) < 0.0001:
+            self.current_pos = self.dest_latlon
             self.running = False
+            return
+        # Move 20% of the remaining distance
+        step = 0.2
+        new_lat = cur_lat + step * dlat
+        new_lon = cur_lon + step * dlon
+        self.current_pos = (new_lat, new_lon)
 
     def run(self):
         while self.running:
@@ -186,7 +185,7 @@ class EmergencyVehicle(threading.Thread):
             if route:
                 print(f"[{self.vehicle_id}] New route via GraphHopper: {route} (Length: {length:.2f} m)")
                 self.send_update(route, length)
-                self.move_along_route(route)
+                self.move_along_route()
             else:
                 print(f"[{self.vehicle_id}] No available route from GraphHopper!")
             time.sleep(UPDATE_INTERVAL)
@@ -195,9 +194,9 @@ class EmergencyVehicle(threading.Thread):
 # Enhanced Visualization with Fixed Scale and Landmarks
 # ================================
 def visualize_network(vehicles, title="GraphHopper Integrated Routes"):
-    # Fixed axis limits to keep the map scale constant (covering the simulation area around Mumbai)
-    fixed_lat_limits = (19.06, 19.14)
-    fixed_lon_limits = (72.87, 72.95)
+    # Set fixed axis limits to cover the area (e.g., around Mumbai)
+    fixed_lat_limits = (18.95, 19.20)
+    fixed_lon_limits = (72.80, 73.05)
     
     plt.clf()
     ax = plt.gca()
@@ -206,33 +205,33 @@ def visualize_network(vehicles, title="GraphHopper Integrated Routes"):
     ax.set_ylim(fixed_lat_limits)
     ax.grid(True, linestyle='--', alpha=0.5)
     
-    # Draw some example static landmarks (replace with real landmarks if available)
+    # Draw example landmarks (replace with actual landmarks if available)
     landmarks = [
-        {"name": "Landmark A", "lat": 19.070, "lon": 72.875},
-        {"name": "Landmark B", "lat": 19.100, "lon": 72.910},
-        {"name": "Landmark C", "lat": 19.130, "lon": 72.940}
+        {"name": "Gateway of India", "lat": 18.9220, "lon": 72.8347},
+        {"name": "Marine Drive", "lat": 18.9500, "lon": 72.8233},
+        {"name": "Chhatrapati Shivaji Terminus", "lat": 18.9400, "lon": 72.8357}
     ]
     for lm in landmarks:
         ax.plot(lm["lon"], lm["lat"], marker="*", color="black", markersize=10)
-        ax.text(lm["lon"]+0.001, lm["lat"]+0.001, lm["name"], fontsize=9, color="black")
+        ax.text(lm["lon"] + 0.001, lm["lat"] + 0.001, lm["name"], fontsize=9, color="black")
     
     colors = {"EV_1": "red", "EV_2": "green", "EV_3": "blue"}
     for ev in vehicles:
-        # Plot starting point (with label)
+        # Plot starting point with label
         start_lat, start_lon = ev.start_latlon
         ax.plot(start_lon, start_lat, marker="o", color=colors.get(ev.vehicle_id, "black"), markersize=8)
         ax.text(start_lon, start_lat, f"{ev.vehicle_id} Start", fontsize=8, color=colors.get(ev.vehicle_id, "black"))
         
-        # Plot destination (with label)
+        # Plot destination with label
         dest_lat, dest_lon = ev.dest_latlon
         ax.plot(dest_lon, dest_lat, marker="X", color=colors.get(ev.vehicle_id, "black"), markersize=10)
         ax.text(dest_lon, dest_lat, f"{ev.vehicle_id} Dest", fontsize=8, color=colors.get(ev.vehicle_id, "black"))
         
         # Plot current position
-        cur_lat, cur_lon = grid_to_latlon(ev.current_pos)
+        cur_lat, cur_lon = ev.current_pos
         ax.plot(cur_lon, cur_lat, marker="s", color=colors.get(ev.vehicle_id, "black"), markersize=8)
         
-        # Plot the route (if available)
+        # Plot route if available and decode it
         if ev.route and len(ev.route) > 0:
             try:
                 route_points = polyline.decode(ev.route)
@@ -248,10 +247,11 @@ def visualize_network(vehicles, title="GraphHopper Integrated Routes"):
 # Main Simulation Loop
 # ================================
 def run_simulation():
+    # Define vehicles with absolute starting and destination coordinates (lat, lon)
     vehicles = [
-        EmergencyVehicle("EV_1", (0, 0), (5, 5)),
-        EmergencyVehicle("EV_2", (2, 1), (5, 3)),
-        EmergencyVehicle("EV_3", (0, 4), (2, 5))
+        EmergencyVehicle("EV_1", (19.0760, 72.8777), (19.1260, 72.9277)),
+        EmergencyVehicle("EV_2", (19.0860, 72.8877), (19.1160, 72.9177)),
+        EmergencyVehicle("EV_3", (19.0660, 72.8677), (19.0960, 72.8977))
     ]
     for ev in vehicles:
         ev.start()
