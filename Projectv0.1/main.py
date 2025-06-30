@@ -11,9 +11,10 @@ import os
 # ================================
 # Configuration & Global Settings
 # ================================
-UPDATE_INTERVAL = 5       # seconds between updates
-ACCIDENT_INTERVAL = 15    # seconds between accident events
-TOTAL_AMBULANCES = 10     # total ambulances in the fleet
+UPDATE_INTERVAL = 5  # seconds between updates
+# Accident intervals will be randomized using an exponential distribution (mean ~15 sec)
+# TOTAL_AMBULANCES is fixed at 10.
+TOTAL_AMBULANCES = 10
 
 # Fixed geographic boundaries for Mumbai (adjust as needed)
 FIXED_LAT_LIMITS = (18.95, 19.20)
@@ -29,7 +30,7 @@ HOSPITALS = [
     {"name": "Hospital D", "lat": 19.0700, "lon": 72.8600}
 ]
 
-# Predefined ambulance fleet (base) locations – chosen to cover Mumbai
+# Predefined ambulance fleet (base) positions – chosen to cover Mumbai
 AMBULANCE_BASES = [
     (19.00, 72.82),
     (19.00, 72.87),
@@ -43,7 +44,7 @@ AMBULANCE_BASES = [
     (19.16, 72.95)
 ]
 
-# Vulnerable (preferred) bases where ambulances should return after drop-off
+# Vulnerable bases (preferred bases) where ambulances should return after drop-off
 VULNERABLE_BASES = [
     (19.00, 72.82),
     (19.16, 73.00)
@@ -60,15 +61,14 @@ SERVER_PORT = 5000
 # GraphHopper configuration (ensure your GraphHopper server is running)
 GH_API_ENDPOINT = "http://127.0.0.1:8989/route"
 
-# Global metrics and event log
+# Global performance metrics and event log
 METRICS = {
     "total_accidents": 0,
     "total_dispatches": 0,
     "total_response_time": 0.0,  # in seconds
     "total_hospital_dropoffs": 0
 }
-
-EVENT_LOG = []  # List of event strings
+EVENT_LOG = []  # list of event strings
 
 # ================================
 # Utility Functions
@@ -80,13 +80,13 @@ def random_coordinate():
     return (lat, lon)
 
 def haversine(coord1, coord2):
-    """Calculate the distance (in km) between two (lat, lon) points."""
+    """Calculate the distance in km between two (lat, lon) points."""
     lat1, lon1 = coord1
     lat2, lon2 = coord2
     R = 6371
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     c = 2 * math.asin(math.sqrt(a))
     return R * c
 
@@ -184,7 +184,9 @@ def update_status():
 def dashboard():
     vehicles = list(vehicle_status_db.values())
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    return render_template_string(DASHBOARD_TEMPLATE, vehicles=vehicles, timestamp=timestamp, metrics=METRICS, events=EVENT_LOG[-10:])
+    # Show last 10 events in reverse order
+    events = EVENT_LOG[-10:][::-1]
+    return render_template_string(DASHBOARD_TEMPLATE, vehicles=vehicles, timestamp=timestamp, metrics=METRICS, events=events)
 
 def run_dashboard():
     app.run(host=SERVER_HOST, port=SERVER_PORT)
@@ -199,19 +201,19 @@ time.sleep(1)
 class Ambulance(threading.Thread):
     def __init__(self, ambulance_id, base_position):
         """
-        Each ambulance starts at its base. Its base is its initial position.
+        Each ambulance starts at its fleet base.
         """
         super().__init__()
         self.ambulance_id = ambulance_id
         self.base_position = base_position  # (lat, lon)
         self.current_pos = base_position
-        self.destination = base_position  # Initially, not on dispatch.
+        self.destination = base_position  # initially, at base
         self.route = ""
         self.route_length = 0.0
-        self.state = "available"  # available, en-route, at accident, to-hospital, returning, dispatched (for accident)
+        self.state = "available"  # available, en-route, at accident, to-hospital, returning
         self.timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         self.running = True
-        self.dispatch_time = None  # Timestamp when dispatched
+        self.dispatch_time = None  # timestamp when dispatched
 
     def compute_route(self):
         """Call GraphHopper API to get route between current_pos and destination."""
@@ -272,13 +274,11 @@ class Ambulance(threading.Thread):
     def run(self):
         while self.running:
             if self.state == "available":
-                # Idle until dispatched
                 time.sleep(UPDATE_INTERVAL)
             elif self.state == "en-route":
                 arrived = self.move_toward(self.destination)
                 self.send_update()
                 if arrived:
-                    # Record response time
                     if self.dispatch_time is not None:
                         response_time = time.time() - self.dispatch_time
                         METRICS["total_response_time"] += response_time
@@ -287,17 +287,17 @@ class Ambulance(threading.Thread):
                         self.dispatch_time = None
                     self.state = "at accident"
                     self.send_update()
+                    EVENT_LOG.append(f"{self.ambulance_id} arrived at accident.")
                 time.sleep(UPDATE_INTERVAL)
             elif self.state == "at accident":
-                print(f"[{self.ambulance_id}] At accident site. Loading patient...")
-                EVENT_LOG.append(f"{self.ambulance_id} arrived at accident.")
-                time.sleep(10)  # Simulate on-scene time
+                print(f"[{self.ambulance_id}] At accident. Loading patient...")
+                EVENT_LOG.append(f"{self.ambulance_id} loading patient.")
+                time.sleep(10)
                 new_dest = get_nearest_hospital(self.current_pos)
-                print(f"[{self.ambulance_id}] Patient loaded. Heading to hospital at {new_dest}.")
-                EVENT_LOG.append(f"{self.ambulance_id} dispatched to hospital {new_dest}.")
-                self.destination = new_dest
                 self.state = "to-hospital"
+                self.destination = new_dest
                 self.send_update()
+                EVENT_LOG.append(f"{self.ambulance_id} dispatched to hospital {new_dest}.")
                 time.sleep(UPDATE_INTERVAL)
             elif self.state == "to-hospital":
                 arrived = self.move_toward(self.destination)
@@ -306,23 +306,21 @@ class Ambulance(threading.Thread):
                     print(f"[{self.ambulance_id}] Arrived at hospital. Dropping off patient...")
                     EVENT_LOG.append(f"{self.ambulance_id} arrived at hospital.")
                     METRICS["total_hospital_dropoffs"] += 1
-                    time.sleep(5)  # Simulate drop-off time
+                    time.sleep(5)
                     preferred_base = get_preferred_base(self.current_pos)
-                    print(f"[{self.ambulance_id}] Returning to preferred base at {preferred_base}.")
-                    EVENT_LOG.append(f"{self.ambulance_id} returning to base at {preferred_base}.")
                     self.destination = preferred_base
                     self.state = "returning"
                     self.send_update()
+                    EVENT_LOG.append(f"{self.ambulance_id} returning to base at {preferred_base}.")
                 time.sleep(UPDATE_INTERVAL)
             elif self.state == "returning":
-                # While returning, if a new accident occurs, FleetManager may reassign
+                # If an accident occurs while returning, FleetManager can reassign this ambulance.
                 arrived = self.move_toward(self.destination)
                 self.send_update()
                 if arrived:
-                    print(f"[{self.ambulance_id}] Arrived at base. Now available.")
-                    EVENT_LOG.append(f"{self.ambulance_id} available at base {self.destination}.")
                     self.state = "available"
                     self.send_update()
+                    EVENT_LOG.append(f"{self.ambulance_id} available at base {self.destination}.")
                 time.sleep(UPDATE_INTERVAL)
             else:
                 time.sleep(UPDATE_INTERVAL)
@@ -332,13 +330,10 @@ class Ambulance(threading.Thread):
 # ================================
 class FleetManager:
     def __init__(self, ambulances):
-        self.ambulances = ambulances  # List of Ambulance objects
-        self.accidents = []           # Active accident events
-
+        self.ambulances = ambulances
+        self.accidents = []  # list of accident events; each is a dict with 'location' and 'dispatched'
+    
     def dispatch_accident(self, accident_location):
-        """Dispatch the best available ambulance to the accident.
-           If none available, reassign a returning ambulance.
-        """
         available = [amb for amb in self.ambulances if amb.state == "available"]
         if available:
             best = min(available, key=lambda amb: haversine(amb.current_pos, accident_location))
@@ -360,15 +355,18 @@ class FleetManager:
             METRICS["total_accidents"] += 1
             return best
         EVENT_LOG.append(f"Accident at {accident_location} occurred but no ambulance available!")
+        METRICS["total_accidents"] += 1
         return None
 
     def simulate_accident(self):
         accident_loc = random_coordinate()
         print(f"Accident occurred at {accident_loc}")
-        self.dispatch_accident(accident_loc)
+        dispatched = self.dispatch_accident(accident_loc)
+        # Always record the accident event
+        self.accidents.append({"location": accident_loc, "dispatched": dispatched.ambulance_id if dispatched else "None"})
 
 # ================================
-# Enhanced Visualization using Folium (Fleet & Events)
+# Enhanced Visualization using Folium for Fleet & Events
 # ================================
 def visualize_fleet_folium(ambulances, accidents, map_file="fleet_map.html"):
     m = folium.Map(location=MAP_CENTER, zoom_start=12)
@@ -382,7 +380,7 @@ def visualize_fleet_folium(ambulances, accidents, map_file="fleet_map.html"):
             icon=folium.Icon(color="darkred", icon="plus-sign")
         ).add_to(m)
     
-    # Plot accident markers (active accidents)
+    # Plot accident markers
     for acc in accidents:
         folium.Marker(
             location=list(acc["location"]),
@@ -396,14 +394,12 @@ def visualize_fleet_folium(ambulances, accidents, map_file="fleet_map.html"):
     
     for amb in ambulances:
         # Only display active ambulances
-        if amb.state != "available":
-            marker_icon = "ambulance"
-        else:
-            marker_icon = "ok-sign"
+        if not amb.running or amb.state == "available":
+            continue  # do not display those that are idle (fleet bases)
         folium.Marker(
             location=list(amb.current_pos),
             popup=f"{amb.ambulance_id} ({amb.state})",
-            icon=folium.Icon(color=colors.get(amb.ambulance_id, "gray"), icon=marker_icon, prefix='fa')
+            icon=folium.Icon(color=colors.get(amb.ambulance_id, "gray"), icon="ambulance", prefix='fa')
         ).add_to(m)
         # Draw route if available
         if amb.route:
@@ -426,7 +422,7 @@ def visualize_fleet_folium(ambulances, accidents, map_file="fleet_map.html"):
 # Main Simulation Loop
 # ================================
 def run_simulation():
-    # Initialize ambulances at their fixed base positions
+    # Initialize ambulances at their fleet base positions
     ambulances = []
     for i in range(TOTAL_AMBULANCES):
         amb_id = f"EV_{i+1}"
@@ -438,18 +434,18 @@ def run_simulation():
     fleet_manager = FleetManager(ambulances)
     map_file = "fleet_map.html"
     
-    # Accident simulation runs in a separate thread
+    # Accident simulation thread with random intervals
     def accident_simulation():
         while True:
             fleet_manager.simulate_accident()
-            time.sleep(ACCIDENT_INTERVAL)
+            sleep_time = random.expovariate(1.0/15)  # average 15 sec, but random
+            time.sleep(sleep_time)
     accident_thread = threading.Thread(target=accident_simulation, daemon=True)
     accident_thread.start()
     
-    # Main loop: update visualization and dashboard
     try:
         while True:
-            # Update accident list: remove accidents if their dispatched ambulance is no longer en-route or at accident.
+            # Remove accidents that are resolved: if the dispatched ambulance is no longer en-route or at accident
             fleet_manager.accidents = [acc for acc in fleet_manager.accidents 
                                        if any(amb.ambulance_id == acc["dispatched"] and amb.state in ["en-route", "at accident"] for amb in ambulances)]
             visualize_fleet_folium(ambulances, fleet_manager.accidents, map_file)
