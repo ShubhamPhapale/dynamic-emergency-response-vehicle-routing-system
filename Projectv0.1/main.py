@@ -7,12 +7,13 @@ from flask import Flask, request, jsonify, render_template_string
 import folium
 import polyline
 import os
+from collections import defaultdict
 
 # ================================
 # Configuration & Global Settings
 # ================================
 UPDATE_INTERVAL = 5       # seconds between updates
-# Accident intervals will be randomized (exponential distribution, mean ~15 sec)
+# Accident intervals are randomized using an exponential distribution (mean ~15 sec)
 TOTAL_AMBULANCES = 10
 
 # Fixed geographic boundaries for Mumbai (approximate)
@@ -21,7 +22,7 @@ FIXED_LON_LIMITS = (72.80, 73.05)
 MAP_CENTER = [ (FIXED_LAT_LIMITS[0] + FIXED_LAT_LIMITS[1]) / 2,
                (FIXED_LON_LIMITS[0] + FIXED_LON_LIMITS[1]) / 2 ]
 
-# For accidents, we use a sub-boundary to ensure on-land incidents
+# For accidents, use a sub-boundary to ensure on-land incidents
 ACCIDENT_LAT_LIMITS = (19.00, 19.18)
 ACCIDENT_LON_LIMITS = (72.85, 73.00)
 
@@ -63,7 +64,7 @@ AMBULANCE_BASES = [
     (19.16, 72.95)
 ]
 
-# Vulnerable bases (preferred bases) for return if no active accident
+# Vulnerable bases (preferred bases) for return if needed (if no active accident)
 VULNERABLE_BASES = [
     (19.00, 72.82),
     (19.16, 73.00)
@@ -117,7 +118,7 @@ def haversine(coord1, coord2):
     R = 6371
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
     c = 2 * math.asin(math.sqrt(a))
     return R * c
 
@@ -137,7 +138,7 @@ def get_nearest_hospital(position):
 app = Flask(__name__)
 vehicle_status_db = {}
 
-# Updated dashboard template with Chart.js integration for a simple bar chart of key metrics.
+# Dashboard template with enhanced visuals and multiple charts (Chart.js)
 DASHBOARD_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -148,13 +149,15 @@ DASHBOARD_TEMPLATE = """
     <style>
       body { font-family: Arial, sans-serif; margin: 20px; }
       h2, h3 { color: #333; }
+      .container { display: flex; flex-wrap: wrap; gap: 20px; }
+      .chart-container { flex: 1 1 300px; }
       .metrics, .event-log, .fleet-status { margin-bottom: 20px; }
       .event-log { font-size: 0.9em; color: #555; max-height: 200px; overflow-y: scroll; }
-      table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+      table { border-collapse: collapse; width: 100%; margin-top: 20px; }
       th, td { padding: 8px; border: 1px solid #ddd; text-align: left; }
       tr:nth-child(even) { background-color: #f2f2f2; }
     </style>
-    <!-- Include Chart.js from CDN -->
+    <!-- Chart.js CDN -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
       setInterval(function() { window.location.reload(); }, 5000);
@@ -176,8 +179,16 @@ DASHBOARD_TEMPLATE = """
       </p>
       <p>Current Condition: {{ condition }}</p>
     </div>
-    <div class="chart-container" style="width: 600px; height: 400px;">
-      <canvas id="metricsChart"></canvas>
+    <div class="container">
+      <div class="chart-container">
+        <canvas id="barChart"></canvas>
+      </div>
+      <div class="chart-container">
+        <canvas id="lineChart"></canvas>
+      </div>
+      <div class="chart-container">
+        <canvas id="pieChart"></canvas>
+      </div>
     </div>
     <div class="event-log">
       <h3>Recent Event Log</h3>
@@ -223,8 +234,8 @@ DASHBOARD_TEMPLATE = """
     </table>
     
     <script>
-      // Prepare data for the bar chart
-      const data = {
+      // Bar Chart: Key Performance Metrics
+      const barData = {
         labels: ["Accidents", "Dispatches", "Drop-offs", "Avg Response (s)"],
         datasets: [{
           label: 'Performance',
@@ -253,23 +264,54 @@ DASHBOARD_TEMPLATE = """
           borderWidth: 1
         }]
       };
-      
-      const config = {
+      const barConfig = {
         type: 'bar',
-        data: data,
-        options: {
-          scales: {
-            y: {
-              beginAtZero: true
-            }
-          }
-        }
+        data: barData,
+        options: { scales: { y: { beginAtZero: true } } }
       };
-      
-      var myChart = new Chart(
-        document.getElementById('metricsChart'),
-        config
-      );
+      new Chart(document.getElementById('barChart'), barConfig);
+
+      // Line Chart: Accident Frequency over last 10 minutes
+      const now = Date.now();
+      const accidentTimes = {{ accident_times|tojson }};
+      const buckets = Array(10).fill(0);
+      accidentTimes.forEach(ts => {
+        const diff = now - ts;
+        const minutes = diff / 60000;
+        if (minutes < 10) {
+          buckets[9 - Math.floor(minutes)] += 1;
+        }
+      });
+      const lineData = {
+        labels: Array.from({length: 10}, (_, i) => `${10 - i} min ago`),
+        datasets: [{
+          label: 'Accidents per Minute',
+          data: buckets,
+          fill: false,
+          borderColor: 'rgba(255, 159, 64, 1)',
+          tension: 0.1
+        }]
+      };
+      const lineConfig = { type: 'line', data: lineData };
+      new Chart(document.getElementById('lineChart'), lineConfig);
+
+      // Pie Chart: Ambulance State Distribution
+      const ambulanceStates = {{ ambulance_states|tojson }};
+      const pieData = {
+        labels: Object.keys(ambulanceStates),
+        datasets: [{
+          data: Object.values(ambulanceStates),
+          backgroundColor: [
+            'rgba(75, 192, 192, 0.7)',
+            'rgba(54, 162, 235, 0.7)',
+            'rgba(255, 205, 86, 0.7)',
+            'rgba(255, 99, 132, 0.7)',
+            'rgba(153, 102, 255, 0.7)'
+          ]
+        }]
+      };
+      const pieConfig = { type: 'pie', data: pieData };
+      new Chart(document.getElementById('pieChart'), pieConfig);
     </script>
   </body>
 </html>
@@ -289,7 +331,14 @@ def dashboard():
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     events = EVENT_LOG[-10:][::-1]
     condition = current_condition()
-    return render_template_string(DASHBOARD_TEMPLATE, vehicles=vehicles, timestamp=timestamp, metrics=METRICS, events=events, bases=AMBULANCE_BASES, condition=condition)
+    state_counts = {}
+    for v in vehicles:
+        state = v.get("state", "unknown")
+        state_counts[state] = state_counts.get(state, 0) + 1
+    accident_times = [ts * 1000 for ts in ACCIDENT_TIMESTAMPS]
+    return render_template_string(DASHBOARD_TEMPLATE, vehicles=vehicles, timestamp=timestamp, 
+                                  metrics=METRICS, events=events, bases=AMBULANCE_BASES, 
+                                  condition=condition, accident_times=accident_times, ambulance_states=state_counts)
 
 def run_dashboard():
     app.run(host=SERVER_HOST, port=SERVER_PORT)
@@ -402,7 +451,6 @@ class Ambulance(threading.Thread):
                     EVENT_LOG.append(f"{self.ambulance_id} arrived at hospital.")
                     METRICS["total_hospital_dropoffs"] += 1
                     time.sleep(5)
-                    # If there is an active accident, reassign; else return to its own base.
                     if fleet_manager.accidents:
                         active_accidents = [acc["location"] for acc in fleet_manager.accidents]
                         nearest_acc = min(active_accidents, key=lambda loc: haversine(self.current_pos, loc))
@@ -433,7 +481,7 @@ class Ambulance(threading.Thread):
 class FleetManager:
     def __init__(self, ambulances):
         self.ambulances = ambulances
-        self.accidents = []  # each accident: dict with 'location', 'dispatched', and 'timestamp'
+        self.accidents = []  # each accident: dict with 'location', 'dispatched', 'timestamp'
     
     def dispatch_accident(self, accident_location):
         available = [amb for amb in self.ambulances if amb.state == "available"]
@@ -467,10 +515,14 @@ class FleetManager:
         accident_loc = random_accident_coordinate()
         print(f"Accident occurred at {accident_loc}")
         dispatched = self.dispatch_accident(accident_loc)
-        self.accidents.append({"location": accident_loc, "dispatched": dispatched.ambulance_id if dispatched else "None", "timestamp": time.time()})
+        self.accidents.append({
+            "location": accident_loc, 
+            "dispatched": dispatched.ambulance_id if dispatched else "None", 
+            "timestamp": time.time()
+        })
 
 # ================================
-# Enhanced Visualization using Folium for Fleet & Events
+# Enhanced Visualization using Folium (Fleet, Accidents, and Events)
 # ================================
 def visualize_fleet_folium(ambulances, accidents, map_file="fleet_map.html"):
     m = folium.Map(location=MAP_CENTER, zoom_start=12)
@@ -484,9 +536,9 @@ def visualize_fleet_folium(ambulances, accidents, map_file="fleet_map.html"):
             icon=folium.Icon(color="darkred", icon="plus-sign")
         ).add_to(m)
     
-    # Plot accident markers for accidents within the last 60 seconds
+    # Plot accident markers for accidents within the last 120 seconds
     now = time.time()
-    recent_accidents = [acc for acc in accidents if now - acc["timestamp"] < 60]
+    recent_accidents = [acc for acc in accidents if now - acc["timestamp"] < 120]
     for acc in recent_accidents:
         folium.Marker(
             location=list(acc["location"]),
@@ -499,7 +551,6 @@ def visualize_fleet_folium(ambulances, accidents, map_file="fleet_map.html"):
               "EV_9": "darkgreen", "EV_10": "black"}
     
     for amb in ambulances:
-        # Always display the ambulance marker and its route.
         folium.Marker(
             location=list(amb.current_pos),
             popup=f"{amb.ambulance_id} ({amb.state})",
@@ -517,7 +568,7 @@ def visualize_fleet_folium(ambulances, accidents, map_file="fleet_map.html"):
                 ).add_to(m)
             except Exception as e:
                 print(f"Error decoding route for {amb.ambulance_id}: {e}")
-        # Plot base marker (always show base location)
+        # Always plot the base marker
         folium.Marker(
             location=list(amb.base_position),
             popup=f"{amb.ambulance_id} Base",
@@ -531,7 +582,6 @@ def visualize_fleet_folium(ambulances, accidents, map_file="fleet_map.html"):
 # Main Simulation Loop
 # ================================
 def run_simulation():
-    # Initialize ambulances at fixed base positions
     ambulances = []
     for i in range(TOTAL_AMBULANCES):
         amb_id = f"EV_{i+1}"
@@ -548,7 +598,7 @@ def run_simulation():
     def accident_simulation():
         while True:
             fleet_manager.simulate_accident()
-            sleep_time = random.expovariate(1.0/15)  # mean ~15 sec
+            sleep_time = random.expovariate(1.0/15)  # mean ~15 sec // 50
             time.sleep(sleep_time)
     accident_thread = threading.Thread(target=accident_simulation, daemon=True)
     accident_thread.start()
