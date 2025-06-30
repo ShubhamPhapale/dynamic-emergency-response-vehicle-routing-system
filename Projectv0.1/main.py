@@ -11,7 +11,7 @@ import os
 # ================================
 # Configuration & Global Settings
 # ================================
-UPDATE_INTERVAL = 5  # seconds between updates
+UPDATE_INTERVAL = 5       # seconds between updates
 # Accident intervals will be randomized (exponential distribution, mean ~15 sec)
 TOTAL_AMBULANCES = 10
 
@@ -25,7 +25,7 @@ MAP_CENTER = [ (FIXED_LAT_LIMITS[0] + FIXED_LAT_LIMITS[1]) / 2,
 ACCIDENT_LAT_LIMITS = (19.00, 19.18)
 ACCIDENT_LON_LIMITS = (72.85, 73.00)
 
-# Actual hospital locations in Mumbai (top 20 hospitals, approximate coordinates)
+# Actual hospital locations in Mumbai (top 20 hospitals, approximate)
 HOSPITALS = [
     {"name": "KEM Hospital", "lat": 19.0176, "lon": 72.8562},
     {"name": "Lilavati Hospital", "lat": 19.0738, "lon": 72.8400},
@@ -63,10 +63,14 @@ AMBULANCE_BASES = [
     (19.16, 72.95)
 ]
 
-# For returning, ideally the ambulance should go back to its original base.
-# We remember each ambulance's base in its own object.
-# However, if an active accident exists, the ambulance may be reassigned.
-# (Fleet Manager will decide.)
+# Vulnerable bases (preferred bases) for return if no active accident
+VULNERABLE_BASES = [
+    (19.00, 72.82),
+    (19.16, 73.00)
+]
+
+def get_preferred_base(current_position):
+    return min(VULNERABLE_BASES, key=lambda base: haversine(current_position, base))
 
 # Server configuration for our central dashboard
 SERVER_HOST = '127.0.0.1'
@@ -75,7 +79,7 @@ SERVER_PORT = 5000
 # GraphHopper API endpoint (ensure your GraphHopper server is running with valid OSM data)
 GH_API_ENDPOINT = "http://127.0.0.1:8989/route"
 
-# Global performance metrics, event log, and accident timestamps for condition estimation
+# Global performance metrics, event log, and accident timestamps
 METRICS = {
     "total_accidents": 0,
     "total_dispatches": 0,
@@ -84,6 +88,16 @@ METRICS = {
 }
 EVENT_LOG = []
 ACCIDENT_TIMESTAMPS = []
+
+def current_condition():
+    now = time.time()
+    recent = [ts for ts in ACCIDENT_TIMESTAMPS if now - ts < 60]
+    if len(recent) >= 3:
+        return "High Accident Load"
+    elif len(recent) > 0:
+        return "Moderate Accident Load"
+    else:
+        return "Normal"
 
 # ================================
 # Utility Functions
@@ -103,7 +117,7 @@ def haversine(coord1, coord2):
     R = 6371
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     c = 2 * math.asin(math.sqrt(a))
     return R * c
 
@@ -117,24 +131,13 @@ def get_nearest_hospital(position):
             nearest = (hosp["lat"], hosp["lon"])
     return nearest
 
-# Compute current condition based on accident rate over last minute
-def current_condition():
-    now = time.time()
-    recent = [ts for ts in ACCIDENT_TIMESTAMPS if now - ts < 60]
-    rate = len(recent)
-    if rate >= 3:
-        return "High Accident Load"
-    elif rate > 0:
-        return "Moderate Accident Load"
-    else:
-        return "Normal"
-
 # ================================
 # Flask Server (Central Dashboard)
 # ================================
 app = Flask(__name__)
 vehicle_status_db = {}
 
+# Updated dashboard template with Chart.js integration for a simple bar chart of key metrics.
 DASHBOARD_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -145,13 +148,14 @@ DASHBOARD_TEMPLATE = """
     <style>
       body { font-family: Arial, sans-serif; margin: 20px; }
       h2, h3 { color: #333; }
+      .metrics, .event-log, .fleet-status { margin-bottom: 20px; }
+      .event-log { font-size: 0.9em; color: #555; max-height: 200px; overflow-y: scroll; }
       table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
       th, td { padding: 8px; border: 1px solid #ddd; text-align: left; }
       tr:nth-child(even) { background-color: #f2f2f2; }
-      .metrics { margin-bottom: 20px; }
-      .event-log { font-size: 0.9em; color: #555; max-height: 200px; overflow-y: scroll; }
-      .fleet-status { margin-top: 20px; }
     </style>
+    <!-- Include Chart.js from CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
       setInterval(function() { window.location.reload(); }, 5000);
     </script>
@@ -172,6 +176,9 @@ DASHBOARD_TEMPLATE = """
       </p>
       <p>Current Condition: {{ condition }}</p>
     </div>
+    <div class="chart-container" style="width: 600px; height: 400px;">
+      <canvas id="metricsChart"></canvas>
+    </div>
     <div class="event-log">
       <h3>Recent Event Log</h3>
       <ul>
@@ -183,7 +190,7 @@ DASHBOARD_TEMPLATE = """
     <div class="fleet-status">
       <h3>Fleet Base Status</h3>
       {% for base in bases %}
-        <p>Base {{ base[0] }}, {{ base[1] }}: 
+        <p>Base ({{ base[0] }}, {{ base[1] }}): 
         {% set ambulances_here = [] %}
         {% for amb in vehicles %}
           {% if amb.state == "available" and (amb.current_pos[0]|round(2), amb.current_pos[1]|round(2)) == (base[0]|round(2), base[1]|round(2)) %}
@@ -214,6 +221,56 @@ DASHBOARD_TEMPLATE = """
       </tr>
       {% endfor %}
     </table>
+    
+    <script>
+      // Prepare data for the bar chart
+      const data = {
+        labels: ["Accidents", "Dispatches", "Drop-offs", "Avg Response (s)"],
+        datasets: [{
+          label: 'Performance',
+          data: [
+            {{ metrics.total_accidents }},
+            {{ metrics.total_dispatches }},
+            {{ metrics.total_hospital_dropoffs }},
+            {% if metrics.total_dispatches > 0 %}
+              {{ "%.2f"|format(metrics.total_response_time / metrics.total_dispatches) }}
+            {% else %}
+              0
+            {% endif %}
+          ],
+          backgroundColor: [
+            'rgba(255, 99, 132, 0.7)',
+            'rgba(54, 162, 235, 0.7)',
+            'rgba(255, 206, 86, 0.7)',
+            'rgba(75, 192, 192, 0.7)'
+          ],
+          borderColor: [
+            'rgba(255, 99, 132, 1)',
+            'rgba(54, 162, 235, 1)',
+            'rgba(255, 206, 86, 1)',
+            'rgba(75, 192, 192, 1)'
+          ],
+          borderWidth: 1
+        }]
+      };
+      
+      const config = {
+        type: 'bar',
+        data: data,
+        options: {
+          scales: {
+            y: {
+              beginAtZero: true
+            }
+          }
+        }
+      };
+      
+      var myChart = new Chart(
+        document.getElementById('metricsChart'),
+        config
+      );
+    </script>
   </body>
 </html>
 """
@@ -232,7 +289,7 @@ def dashboard():
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     events = EVENT_LOG[-10:][::-1]
     condition = current_condition()
-    return render_template_string(DASHBOARD_TEMPLATE, vehicles=vehicles, timestamp=timestamp, metrics=METRICS, events=events, bases=AMBULANCE_BASES)
+    return render_template_string(DASHBOARD_TEMPLATE, vehicles=vehicles, timestamp=timestamp, metrics=METRICS, events=events, bases=AMBULANCE_BASES, condition=condition)
 
 def run_dashboard():
     app.run(host=SERVER_HOST, port=SERVER_PORT)
@@ -246,14 +303,11 @@ time.sleep(1)
 # ================================
 class Ambulance(threading.Thread):
     def __init__(self, ambulance_id, base_position):
-        """
-        Each ambulance starts at its fleet base.
-        """
         super().__init__()
         self.ambulance_id = ambulance_id
-        self.base_position = base_position  # (lat, lon)
+        self.base_position = base_position
         self.current_pos = base_position
-        self.destination = base_position  # initially, at base
+        self.destination = base_position
         self.route = ""
         self.route_length = 0.0
         self.state = "available"  # available, en-route, at accident, to-hospital, returning
@@ -348,9 +402,8 @@ class Ambulance(threading.Thread):
                     EVENT_LOG.append(f"{self.ambulance_id} arrived at hospital.")
                     METRICS["total_hospital_dropoffs"] += 1
                     time.sleep(5)
-                    # Check if there is an active accident
+                    # If there is an active accident, reassign; else return to its own base.
                     if fleet_manager.accidents:
-                        # Reassign to the nearest active accident
                         active_accidents = [acc["location"] for acc in fleet_manager.accidents]
                         nearest_acc = min(active_accidents, key=lambda loc: haversine(self.current_pos, loc))
                         self.destination = nearest_acc
@@ -358,7 +411,6 @@ class Ambulance(threading.Thread):
                         self.dispatch_time = time.time()
                         EVENT_LOG.append(f"{self.ambulance_id} reassigned to accident at {nearest_acc}.")
                     else:
-                        # Otherwise, return to its original base
                         self.destination = self.base_position
                         self.state = "returning"
                         EVENT_LOG.append(f"{self.ambulance_id} returning to base {self.base_position}.")
@@ -381,7 +433,7 @@ class Ambulance(threading.Thread):
 class FleetManager:
     def __init__(self, ambulances):
         self.ambulances = ambulances
-        self.accidents = []  # each accident: dict with 'location' and 'dispatched'
+        self.accidents = []  # each accident: dict with 'location', 'dispatched', and 'timestamp'
     
     def dispatch_accident(self, accident_location):
         available = [amb for amb in self.ambulances if amb.state == "available"]
@@ -414,9 +466,8 @@ class FleetManager:
     def simulate_accident(self):
         accident_loc = random_accident_coordinate()
         print(f"Accident occurred at {accident_loc}")
-        self.dispatch_accident(accident_loc)
-        # Record accident event regardless of dispatch
-        self.accidents.append({"location": accident_loc, "dispatched": None})
+        dispatched = self.dispatch_accident(accident_loc)
+        self.accidents.append({"location": accident_loc, "dispatched": dispatched.ambulance_id if dispatched else "None", "timestamp": time.time()})
 
 # ================================
 # Enhanced Visualization using Folium for Fleet & Events
@@ -433,11 +484,13 @@ def visualize_fleet_folium(ambulances, accidents, map_file="fleet_map.html"):
             icon=folium.Icon(color="darkred", icon="plus-sign")
         ).add_to(m)
     
-    # Plot accident markers
-    for acc in accidents:
+    # Plot accident markers for accidents within the last 60 seconds
+    now = time.time()
+    recent_accidents = [acc for acc in accidents if now - acc["timestamp"] < 60]
+    for acc in recent_accidents:
         folium.Marker(
             location=list(acc["location"]),
-            popup=f"Accident",
+            popup=f"Accident (Ambulance: {acc['dispatched']})",
             icon=folium.Icon(color="orange", icon="exclamation-sign")
         ).add_to(m)
     
@@ -446,13 +499,12 @@ def visualize_fleet_folium(ambulances, accidents, map_file="fleet_map.html"):
               "EV_9": "darkgreen", "EV_10": "black"}
     
     for amb in ambulances:
-        # Always display the ambulance marker along with its base marker if available
+        # Always display the ambulance marker and its route.
         folium.Marker(
             location=list(amb.current_pos),
             popup=f"{amb.ambulance_id} ({amb.state})",
             icon=folium.Icon(color=colors.get(amb.ambulance_id, "gray"), icon="ambulance", prefix='fa')
         ).add_to(m)
-        # Draw route if available
         if amb.route:
             try:
                 route_points = polyline.decode(amb.route)
@@ -465,13 +517,12 @@ def visualize_fleet_folium(ambulances, accidents, map_file="fleet_map.html"):
                 ).add_to(m)
             except Exception as e:
                 print(f"Error decoding route for {amb.ambulance_id}: {e}")
-        # Plot base marker for ambulances that are available (to show fleet distribution)
-        if amb.state == "available":
-            folium.Marker(
-                location=list(amb.base_position),
-                popup=f"{amb.ambulance_id} Base",
-                icon=folium.Icon(color="blue", icon="home")
-            ).add_to(m)
+        # Plot base marker (always show base location)
+        folium.Marker(
+            location=list(amb.base_position),
+            popup=f"{amb.ambulance_id} Base",
+            icon=folium.Icon(color="blue", icon="home")
+        ).add_to(m)
     
     m.save(map_file)
     print(f"Fleet map updated and saved to {map_file}. Refresh your browser to see changes.")
@@ -480,7 +531,7 @@ def visualize_fleet_folium(ambulances, accidents, map_file="fleet_map.html"):
 # Main Simulation Loop
 # ================================
 def run_simulation():
-    # Initialize ambulances at their fixed base positions
+    # Initialize ambulances at fixed base positions
     ambulances = []
     for i in range(TOTAL_AMBULANCES):
         amb_id = f"EV_{i+1}"
@@ -497,14 +548,13 @@ def run_simulation():
     def accident_simulation():
         while True:
             fleet_manager.simulate_accident()
-            sleep_time = random.expovariate(1.0/60)  # mean ~15 sec //60
+            sleep_time = random.expovariate(1.0/15)  # mean ~15 sec
             time.sleep(sleep_time)
     accident_thread = threading.Thread(target=accident_simulation, daemon=True)
     accident_thread.start()
     
     try:
         while True:
-            # Remove accident events if the dispatched ambulance is no longer in "en-route" or "at accident"
             fleet_manager.accidents = [acc for acc in fleet_manager.accidents 
                                        if any(amb.ambulance_id == acc.get("dispatched") and amb.state in ["en-route", "at accident"] for amb in ambulances)]
             visualize_fleet_folium(ambulances, fleet_manager.accidents, map_file)
