@@ -1,26 +1,27 @@
 import threading
 import time
 import random
+import math
 import requests
 from flask import Flask, request, jsonify, render_template_string
 import folium
 import polyline
 import os
-import math
 
 # ================================
 # Configuration & Global Settings
 # ================================
-# Simulation parameters
-UPDATE_INTERVAL = 5  # seconds between map updates
+UPDATE_INTERVAL = 5       # seconds between map updates
+SPAWN_INTERVAL = 10       # seconds between new vehicle spawns
+INITIAL_VEHICLE_COUNT = 3 # initial number of vehicles
 
 # Fixed geographic boundaries for Mumbai (adjust as needed)
 FIXED_LAT_LIMITS = (18.95, 19.20)
 FIXED_LON_LIMITS = (72.80, 73.05)
-MAP_CENTER = [(FIXED_LAT_LIMITS[0] + FIXED_LAT_LIMITS[1]) / 2,
-              (FIXED_LON_LIMITS[0] + FIXED_LON_LIMITS[1]) / 2]
+MAP_CENTER = [ (FIXED_LAT_LIMITS[0] + FIXED_LAT_LIMITS[1]) / 2,
+               (FIXED_LON_LIMITS[0] + FIXED_LON_LIMITS[1]) / 2 ]
 
-# Define a list of hospital locations (absolute lat, lon)
+# Predefined hospital locations (example list)
 HOSPITALS = [
     {"name": "Hospital A", "lat": 19.0800, "lon": 72.8800},
     {"name": "Hospital B", "lat": 19.1000, "lon": 72.9000},
@@ -39,13 +40,13 @@ GH_API_ENDPOINT = "http://127.0.0.1:8989/route"
 # Utility Functions
 # ================================
 def random_coordinate():
-    """Generate a random (lat, lon) within the fixed boundaries."""
+    """Generate a random (lat, lon) within fixed boundaries."""
     lat = random.uniform(FIXED_LAT_LIMITS[0], FIXED_LAT_LIMITS[1])
     lon = random.uniform(FIXED_LON_LIMITS[0], FIXED_LON_LIMITS[1])
     return (lat, lon)
 
 def haversine(coord1, coord2):
-    """Calculate the great circle distance (in kilometers) between two points on Earth."""
+    """Calculate distance in km between two (lat, lon) points using Haversine formula."""
     lat1, lon1 = coord1
     lat2, lon2 = coord2
     R = 6371  # Earth radius in km
@@ -56,14 +57,14 @@ def haversine(coord1, coord2):
     return R * c
 
 def get_nearest_hospital(position):
-    """Return the (lat, lon) of the nearest hospital from our HOSPITALS list."""
+    """Return the (lat, lon) of the nearest hospital from the HOSPITALS list."""
     nearest = None
     min_dist = float('inf')
-    for hospital in HOSPITALS:
-        d = haversine(position, (hospital["lat"], hospital["lon"]))
+    for hosp in HOSPITALS:
+        d = haversine(position, (hosp["lat"], hosp["lon"]))
         if d < min_dist:
             min_dist = d
-            nearest = (hospital["lat"], hospital["lon"])
+            nearest = (hosp["lat"], hosp["lon"])
     return nearest
 
 # ================================
@@ -155,9 +156,10 @@ class EmergencyVehicle(threading.Thread):
         self.vehicle_id = vehicle_id
         self.start_latlon = start_latlon
         self.dest_latlon = dest_latlon
-        self.current_pos = start_latlon  # current position as (lat, lon)
+        self.current_pos = start_latlon
         self.route = ""
         self.route_length = 0.0
+        self.running = True
 
     def compute_route(self):
         """Call GraphHopper's Directions API using absolute coordinates."""
@@ -202,19 +204,18 @@ class EmergencyVehicle(threading.Thread):
             print(f"[{self.vehicle_id}] Error sending update: {e}")
 
     def move_along_route(self):
-        """Move the vehicle by a fixed fraction of the remaining distance toward the destination.
-           When it gets very close, update its destination to the nearest hospital.
+        """Move the vehicle by a fraction of the remaining distance.
+           When destination is reached, mark this vehicle as finished.
         """
         cur_lat, cur_lon = self.current_pos
         dest_lat, dest_lon = self.dest_latlon
         dlat = dest_lat - cur_lat
         dlon = dest_lon - cur_lon
 
-        # If vehicle is very close to destination, assign a new destination (nearest hospital)
+        # If vehicle is very close to destination, mark it finished
         if abs(dlat) < 0.0005 and abs(dlon) < 0.0005:
-            new_dest = get_nearest_hospital(self.current_pos)
-            print(f"[{self.vehicle_id}] Reached destination. New hospital destination: {new_dest}")
-            self.dest_latlon = new_dest
+            print(f"[{self.vehicle_id}] Reached destination.")
+            self.running = False
             return
 
         step = 0.2  # fraction of remaining distance to move
@@ -223,7 +224,7 @@ class EmergencyVehicle(threading.Thread):
         self.current_pos = (new_lat, new_lon)
 
     def run(self):
-        while True:
+        while self.running:
             route, length = self.compute_route()
             if route:
                 print(f"[{self.vehicle_id}] New route (Length: {length:.2f} m)")
@@ -237,7 +238,6 @@ class EmergencyVehicle(threading.Thread):
 # Enhanced Visualization using Folium
 # ================================
 def visualize_network_folium(vehicles, map_file="map.html"):
-    # Create a Folium map using OSM tiles
     m = folium.Map(location=MAP_CENTER, zoom_start=12)
     m.get_root().html.add_child(folium.Element('<meta http-equiv="refresh" content="5">'))
     
@@ -249,22 +249,18 @@ def visualize_network_folium(vehicles, map_file="map.html"):
             icon=folium.Icon(color="darkred", icon="plus-sign")
         ).add_to(m)
     
-    # Add vehicle markers and routes
     colors = {"EV_1": "red", "EV_2": "green", "EV_3": "blue"}
+    # Only display active vehicles
     for ev in vehicles:
-        # Start marker
-        folium.Marker(
-            location=list(ev.start_latlon),
-            popup=f"{ev.vehicle_id} Start",
-            icon=folium.Icon(color="blue", icon="play")
-        ).add_to(m)
-        # Destination marker
+        if not ev.running:
+            continue
+        # Plot destination marker
         folium.Marker(
             location=list(ev.dest_latlon),
             popup=f"{ev.vehicle_id} Hospital",
             icon=folium.Icon(color="darkred", icon="hospital-o")
         ).add_to(m)
-        # Current position marker
+        # Plot current position marker
         folium.Marker(
             location=list(ev.current_pos),
             popup=f"{ev.vehicle_id} Current",
@@ -291,31 +287,48 @@ def visualize_network_folium(vehicles, map_file="map.html"):
 # Main Simulation Loop
 # ================================
 def run_simulation():
-    # Initialize vehicles with random start positions (on land) within the bounds
-    # and assign their destination as the nearest hospital to the start.
     vehicles = []
-    for veh_id in ["EV_1", "EV_2", "EV_3"]:
+    vehicle_counter = 1
+
+    # Spawn initial vehicles with random start positions and destination as nearest hospital.
+    for _ in range(INITIAL_VEHICLE_COUNT):
         start = random_coordinate()
         dest = get_nearest_hospital(start)
-        print(f"Initializing {veh_id}: Start: {start}, Nearest Hospital: {dest}")
-        vehicles.append(EmergencyVehicle(veh_id, start, dest))
-    
-    for ev in vehicles:
-        ev.start()
+        veh_id = f"EV_{vehicle_counter}"
+        vehicle_counter += 1
+        new_vehicle = EmergencyVehicle(veh_id, start, dest)
+        new_vehicle.start()
+        vehicles.append(new_vehicle)
+        print(f"Spawned {veh_id}: Start: {start}, Hospital: {dest}")
     
     map_file = "map.html"
-    # Run simulation indefinitely until interrupted
+    last_spawn_time = time.time()
+    
     try:
         while True:
+            # Remove finished vehicles
+            vehicles = [v for v in vehicles if v.running]
+            # Spawn a new vehicle every SPAWN_INTERVAL seconds
+            if time.time() - last_spawn_time > SPAWN_INTERVAL:
+                start = random_coordinate()
+                dest = get_nearest_hospital(start)
+                veh_id = f"EV_{vehicle_counter}"
+                vehicle_counter += 1
+                new_vehicle = EmergencyVehicle(veh_id, start, dest)
+                new_vehicle.start()
+                vehicles.append(new_vehicle)
+                print(f"Spawned {veh_id}: Start: {start}, Hospital: {dest}")
+                last_spawn_time = time.time()
+            
             visualize_network_folium(vehicles, map_file)
             time.sleep(UPDATE_INTERVAL)
     except KeyboardInterrupt:
         print("Simulation interrupted by user.")
     
-    for ev in vehicles:
-        ev.running = False
-    for ev in vehicles:
-        ev.join()
+    for v in vehicles:
+        v.running = False
+    for v in vehicles:
+        v.join()
     print("Simulation completed.")
 
 # ================================
